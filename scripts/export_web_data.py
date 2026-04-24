@@ -79,6 +79,45 @@ def _expected_goals(mat: np.ndarray) -> tuple[float, float]:
     return float(hg), float(ag)
 
 
+def _latest_backtest_runs(conn) -> list[dict]:
+    """Most recent walk-forward backtest per league, for the Track Record panel."""
+    rows = conn.execute(
+        """SELECT r.id, l.code, l.name AS league_name, r.seasons, r.xi, r.n_predictions,
+                  r.log_loss_1x2, r.market_log_loss_1x2,
+                  r.rps_1x2, r.market_rps_1x2,
+                  r.log_loss_ou25, r.market_log_loss_ou25,
+                  r.simulated_n_bets, r.simulated_roi,
+                  r.bankroll_start, r.bankroll_final, r.created_at
+           FROM backtest_runs r
+           JOIN leagues l ON l.id = r.league_id
+           WHERE r.id IN (
+               SELECT MAX(id) FROM backtest_runs GROUP BY league_id
+           )
+           ORDER BY l.code"""
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "league_code": r["code"],
+            "league_name": r["league_name"],
+            "seasons": r["seasons"],
+            "xi": r["xi"],
+            "n_predictions": r["n_predictions"],
+            "model_log_loss_1x2": r["log_loss_1x2"],
+            "market_log_loss_1x2": r["market_log_loss_1x2"],
+            "model_rps_1x2": r["rps_1x2"],
+            "market_rps_1x2": r["market_rps_1x2"],
+            "model_log_loss_ou25": r["log_loss_ou25"],
+            "market_log_loss_ou25": r["market_log_loss_ou25"],
+            "simulated_bets": r["simulated_n_bets"],
+            "simulated_roi": r["simulated_roi"],
+            "bankroll_start": r["bankroll_start"],
+            "bankroll_final": r["bankroll_final"],
+            "run_at": r["created_at"],
+        })
+    return out
+
+
 def _recent_form(conn, team_id: int, before_iso: str, n: int = 5) -> str:
     rows = conn.execute(
         """SELECT home_team_id, away_team_id, fthg, ftag
@@ -201,6 +240,7 @@ def _build_fixture(
 
     # Market-devigged 1X2 (tries a few sharp books in order).
     market_1x2_probs = None
+    market_1x2_source = None
     for book in ("Pinnacle", "Bet365", "WilliamHill"):
         prices = {}
         for sel in ("home", "draw", "away"):
@@ -213,6 +253,25 @@ def _build_fixture(
             try:
                 devig = shin([prices["home"], prices["draw"], prices["away"]])
                 market_1x2_probs = {"home": float(devig[0]), "draw": float(devig[1]), "away": float(devig[2])}
+                market_1x2_source = book
+                break
+            except ValueError:
+                continue
+
+    # Market-devigged OU 2.5 (same sharp-book preference).
+    market_ou25_probs = None
+    for book in ("Pinnacle", "Bet365", "WilliamHill"):
+        prices = {}
+        for sel in ("over", "under"):
+            p = _best_book_price(
+                [r for r in odds_rows if r["book"] == book], "OU", sel, 2.5
+            )
+            if p:
+                prices[sel] = p[0]
+        if len(prices) == 2:
+            try:
+                devig = shin([prices["over"], prices["under"]])
+                market_ou25_probs = {"over": float(devig[0]), "under": float(devig[1])}
                 break
             except ValueError:
                 continue
@@ -236,6 +295,13 @@ def _build_fixture(
         "1X2": (one_x_two, None),
         "OU":  (ou25,      2.5),
     }
+    # Pinnacle-devig reference per market, used to annotate each edge with a
+    # sanity check: edges where the model disagrees with the sharp market by a
+    # large margin are more likely to be miscalibration than real value.
+    market_probs_lookup = {
+        "1X2": market_1x2_probs,
+        "OU":  market_ou25_probs,
+    }
     edges: list[dict] = []
     for market_key, (probs, line) in model_lookup.items():
         key = market_key + (f"_{line}" if line is not None else "")
@@ -250,6 +316,20 @@ def _build_fixture(
             ks = kelly(mp, price, scale=kelly_scale, cap=kelly_cap)
             if ks.fraction <= 0:
                 continue
+            market_probs = market_probs_lookup.get(market_key) or {}
+            mkt_p = market_probs.get(sel)
+            sharp_delta_pp = (mp - mkt_p) * 100.0 if mkt_p is not None else None
+            # Flag edges where the model aggressively disagrees with Pinnacle.
+            # A model prob >15pp above the sharp devigged prob is usually
+            # miscalibration, not value — worth warning rather than hiding.
+            if sharp_delta_pp is None:
+                trust = "unknown"
+            elif sharp_delta_pp > 15:
+                trust = "extreme"
+            elif sharp_delta_pp > 7:
+                trust = "wide"
+            else:
+                trust = "aligned"
             edges.append({
                 "market": market_key,
                 "selection": sel,
@@ -257,6 +337,9 @@ def _build_fixture(
                 "book": book_info["book"],
                 "price": price,
                 "model_prob": mp,
+                "market_prob": mkt_p,
+                "sharp_delta_pp": sharp_delta_pp,
+                "trust": trust,
                 "edge_pct": edge,
                 "kelly_fraction": float(ks.fraction),
                 "tier": _tier(edge),
@@ -329,7 +412,7 @@ def build() -> dict:
                     continue
                 built = _build_fixture(
                     params=params, league=lg, conn=conn, fx=fx, odds_rows=odds,
-                    threshold=0.02, kelly_scale=0.25, kelly_cap=0.02,
+                    threshold=0.03, kelly_scale=0.25, kelly_cap=0.02,
                 )
                 if built:
                     fixtures_out.append(built)
@@ -341,6 +424,10 @@ def build() -> dict:
     total_edges = sum(len(f["edges"]) for f in fixtures_out)
     strong = sum(1 for f in fixtures_out for e in f["edges"] if e["tier"] == "strong")
 
+    # Load the latest backtest metrics for the Track Record section on the site.
+    with connect() as conn:
+        backtest = _latest_backtest_runs(conn)
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "db",
@@ -348,6 +435,7 @@ def build() -> dict:
                       "For entertainment only — not betting advice.",
         "leagues": leagues_seen,
         "fixtures": fixtures_out,
+        "backtest": backtest,
         "stats": {
             "total_fixtures": len(fixtures_out),
             "total_edges": total_edges,

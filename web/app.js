@@ -101,8 +101,11 @@ const App = (() => {
   function renderKpis(fixtures) {
     const totalFix  = fixtures.length;
     const edgeCount = fixtures.reduce((s, f) => s + f.edges.length, 0);
-    const strong    = fixtures.reduce((s, f) => s + f.edges.filter(e => e.tier === 'strong').length, 0);
-    const topEdge   = fixtures.flatMap(f => f.edges).sort((a, b) => b.edge_pct - a.edge_pct)[0];
+    const trustedEdges = fixtures.flatMap(f => f.edges).filter(e => e.trust === 'aligned' || e.trust === 'wide');
+    const strong    = fixtures.reduce((s, f) => s + f.edges.filter(e => e.tier === 'strong' && e.trust !== 'extreme').length, 0);
+    // "Best play" must exclude Extreme-trust edges — those are miscalibration,
+    // not real value, and putting a 200% Extreme edge in the headline misleads.
+    const bestTrusted = trustedEdges.sort((a, b) => b.edge_pct - a.edge_pct)[0];
 
     return `
       <div class="kpi-row">
@@ -114,17 +117,17 @@ const App = (() => {
         <div class="kpi-card">
           <span class="kpi-label">Edges flagged</span>
           <span class="kpi-value">${edgeCount}</span>
-          <span class="kpi-sub">model beats market &gt; 2%</span>
+          <span class="kpi-sub">model beats market &gt; 3%</span>
         </div>
         <div class="kpi-card">
-          <span class="kpi-label">Strong edges</span>
+          <span class="kpi-label">Trusted strong</span>
           <span class="kpi-value warning">${strong}</span>
-          <span class="kpi-sub">7%+ model overlay</span>
+          <span class="kpi-sub">7%+ overlay, within ±15pp of sharps</span>
         </div>
         <div class="kpi-card">
-          <span class="kpi-label">Best play</span>
-          <span class="kpi-value ${topEdge ? 'accent' : ''}">${topEdge ? pctSigned(topEdge.edge_pct) : '—'}</span>
-          <span class="kpi-sub">${topEdge ? `${topEdge.market} · ${topEdge.selection}` : 'none above 2%'}</span>
+          <span class="kpi-label">Best trusted play</span>
+          <span class="kpi-value ${bestTrusted ? 'accent' : ''}">${bestTrusted ? pctSigned(bestTrusted.edge_pct) : '—'}</span>
+          <span class="kpi-sub">${bestTrusted ? `${bestTrusted.market} · ${bestTrusted.selection} (Extreme-trust edges excluded)` : 'none above 3%'}</span>
         </div>
       </div>
     `;
@@ -201,15 +204,22 @@ const App = (() => {
          Model pick · ${fav.label} ${pct(fav.p)}
        </span>`;
 
-    const best = fixture.edges[0];
+    // Surface only trustworthy edges in the card header — Extreme-trust edges
+    // are typically model miscalibration (thin-data teams, single-season shifts)
+    // and featuring a 200% "bet" headline misleads the reader.
+    const trustedEdges = fixture.edges.filter(e => e.trust === 'aligned' || e.trust === 'wide');
+    const best = trustedEdges[0];
+    const anyExtreme = fixture.edges.find(e => e.trust === 'extreme');
     const betBadge = best
-      ? `<span class="bet-badge" title="Best model-vs-market edge — this is a betting recommendation, not a prediction">
+      ? `<span class="bet-badge" title="Best trusted model-vs-market edge (within 15pp of sharps). Extreme-trust edges are hidden here — open the card for all plays.">
            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>
            Bet · ${selectionLabel(best.market, best.selection, best.line, fixture.home.short, fixture.away.short)}
          </span>
          <span class="edge-chip tier-${best.tier}">${pctSigned(best.edge_pct)} edge</span>
          <span class="confidence-stars" title="Edge confidence: ${best.stars}/5">${starsSvg(best.stars)}</span>`
-      : `<span class="bet-badge flat">No edge &gt; 2%</span>`;
+      : anyExtreme
+        ? `<span class="bet-badge flat" title="All edges on this fixture disagree >15pp with Pinnacle — likely miscalibration. Open card for details.">Only extreme-trust edges</span>`
+        : `<span class="bet-badge flat">No edge &gt; 3%</span>`;
     return `<div class="card-meta">${favBadge}${betBadge}</div>`;
   }
 
@@ -253,22 +263,33 @@ const App = (() => {
       </div>
     `;
 
+    const trustLabel = {
+      aligned: { label: 'Aligned', tip: 'Model within ~7pp of Pinnacle — most credible.' },
+      wide:    { label: 'Wide',    tip: 'Model disagrees 7–15pp with Pinnacle — treat with caution.' },
+      extreme: { label: '⚠ Extreme', tip: 'Model disagrees >15pp with Pinnacle — likely miscalibration, not a real edge.' },
+      unknown: { label: '—',       tip: 'No Pinnacle reference available for this market.' },
+    };
     const edgesBlock = fixture.edges.length ? `
       <div>
         <div class="detail-section-title">Recommended plays (¼ Kelly, 2% cap)</div>
         <div class="edge-table-wrap">
         <table class="edge-table">
-          <thead><tr><th>Play</th><th>Book</th><th class="num">Price</th><th class="num">Edge</th><th class="num">Stake</th></tr></thead>
+          <thead><tr><th>Play</th><th>Book</th><th class="num">Price</th><th class="num">Edge</th><th class="num">vs Pinnacle</th><th class="num">Stake</th></tr></thead>
           <tbody>
             ${fixture.edges.map(e => {
               const marketTag = e.market + (e.line != null ? ` ${e.line}` : '');
               const sel = selectionLabel(e.market, e.selection, e.line, fixture.home.short, fixture.away.short);
+              const t = trustLabel[e.trust] || trustLabel.unknown;
+              const deltaTxt = e.sharp_delta_pp == null
+                ? '—'
+                : `${e.sharp_delta_pp > 0 ? '+' : ''}${e.sharp_delta_pp.toFixed(1)}pp`;
               return `
-              <tr>
+              <tr class="trust-${e.trust}">
                 <td><span class="play-cell"><span class="mkt-tag">${marketTag}</span> ${sel}</span></td>
                 <td class="book-cell" title="${e.book}">${e.book}</td>
                 <td class="num">${numPlain(e.price, 2)}</td>
                 <td class="num edge-positive">${pctSigned(e.edge_pct)}</td>
+                <td class="num"><span class="trust-badge trust-${e.trust}" title="${t.tip}">${t.label}<span class="trust-delta">${deltaTxt}</span></span></td>
                 <td class="num">${(e.kelly_fraction * 100).toFixed(2)}u</td>
               </tr>
             `;}).join('')}
@@ -320,6 +341,80 @@ const App = (() => {
     `;
   }
 
+  function renderTrackRecord() {
+    const bt = Array.isArray(payload.backtest) ? payload.backtest : [];
+    if (!bt.length) return '';
+    const rows = bt.map(r => {
+      const mLL = r.model_log_loss_1x2;
+      const kLL = r.market_log_loss_1x2;
+      const beats = (mLL != null && kLL != null && mLL < kLL);
+      const roi = r.simulated_roi || 0;
+      const roiClass = roi > 0 ? 'roi-pos' : 'roi-neg';
+      const beatClass = beats ? 'beats' : 'trails';
+      return `
+        <tr>
+          <td class="league-col">${LEAGUE_FLAG[r.league_code] || ''} ${r.league_name}</td>
+          <td class="num">${r.n_predictions}</td>
+          <td class="num">${mLL?.toFixed(3) ?? '—'}</td>
+          <td class="num muted">${kLL?.toFixed(3) ?? '—'}</td>
+          <td class="num"><span class="beat-pill ${beatClass}">${beats ? 'beats' : 'trails'} market</span></td>
+          <td class="num">${r.simulated_bets}</td>
+          <td class="num ${roiClass}">${(roi * 100).toFixed(1)}%</td>
+        </tr>
+      `;
+    }).join('');
+    // Quick honesty summary
+    const beatCount = bt.filter(r => r.model_log_loss_1x2 != null && r.market_log_loss_1x2 != null && r.model_log_loss_1x2 < r.market_log_loss_1x2).length;
+    const profitable = bt.filter(r => (r.simulated_roi || 0) > 0).length;
+    const totalBets = bt.reduce((s, r) => s + (r.simulated_bets || 0), 0);
+    const totalPnl = bt.reduce((s, r) => {
+      if (r.bankroll_final == null || r.bankroll_start == null) return s;
+      return s + (r.bankroll_final - r.bankroll_start);
+    }, 0);
+    const totalStart = bt.reduce((s, r) => s + (r.bankroll_start || 0), 0);
+    const aggRoi = totalStart > 0 ? (totalPnl / totalStart) : 0;
+
+    return `
+      <section class="track-record">
+        <div class="section-header">
+          <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg>
+          Track record (walk-forward backtest on most recent completed season)
+        </div>
+        <div class="track-summary">
+          <div class="track-fact ${beatCount >= 3 ? 'good' : 'bad'}">
+            <div class="fact-num">${beatCount}/${bt.length}</div>
+            <div class="fact-lbl">leagues where model log-loss beats Pinnacle closing</div>
+          </div>
+          <div class="track-fact ${profitable >= 3 ? 'good' : 'bad'}">
+            <div class="fact-num">${profitable}/${bt.length}</div>
+            <div class="fact-lbl">leagues with positive ROI betting at closing prices</div>
+          </div>
+          <div class="track-fact ${aggRoi >= 0 ? 'good' : 'bad'}">
+            <div class="fact-num">${(aggRoi * 100).toFixed(1)}%</div>
+            <div class="fact-lbl">aggregate simulated ROI on ${totalBets} bets across all leagues</div>
+          </div>
+        </div>
+        <div class="track-table-wrap">
+          <table class="track-table">
+            <thead><tr>
+              <th>League</th>
+              <th class="num">Predictions</th>
+              <th class="num">Model LL</th>
+              <th class="num">Market LL</th>
+              <th class="num">vs market</th>
+              <th class="num">Bets</th>
+              <th class="num">ROI</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <p class="track-note">
+          <strong>LL</strong> = 1X2 log-loss (lower is better). Model predictions generated via walk-forward refit (step = 20 fixtures); bets sized at ¼-Kelly / 2% cap and placed at Pinnacle closing prices. CLV is 0 by construction — this is the strict "would you beat the closing line" test. The honest read: across top-6 leagues last season, the model <em>did not</em> beat Pinnacle's closing line. That is the norm for a public model; shipping these numbers keeps expectations honest.
+        </p>
+      </section>
+    `;
+  }
+
   function renderMethodology() {
     return `
       <section class="methodology">
@@ -327,7 +422,7 @@ const App = (() => {
         <div class="methodology-grid">
           <div class="method-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>Dixon-Coles</h3>
-            <p>Bivariate Poisson with a <code>rho</code> low-score correction and exponential time-decay (<code>xi=0.01</code>). Attack / defense strengths estimated per team, re-fit weekly.</p>
+            <p>Bivariate Poisson with a <code>rho</code> low-score correction and exponential time-decay (<code>xi=0.01</code>, ~70-day half-life). Attack / defense strengths estimated per team, re-fit weekly.</p>
           </div>
           <div class="method-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M21 7h-6"/><path d="M21 7v6"/></svg>Shin devig</h3>
@@ -335,11 +430,19 @@ const App = (() => {
           </div>
           <div class="method-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg>Edge &amp; Kelly</h3>
-            <p>Edge = <code>model_prob × price − 1</code>. Stake is ¼-Kelly, capped at 2% of bankroll to bound variance when the model is wrong.</p>
+            <p>Edge = <code>model_prob × price − 1</code>. Stake is ¼-Kelly, capped at 2% of bankroll to bound variance when the model is wrong. Edges surface only at &gt;3% (below that is market noise).</p>
           </div>
           <div class="method-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>CLV &gt; win rate</h3>
             <p>We judge plays by <em>closing-line value</em> — if you consistently beat the closing price, you have an edge even when variance sends the win rate sideways.</p>
+          </div>
+          <div class="method-card limitations">
+            <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>What the model doesn't know</h3>
+            <p>The model sees <em>results only</em>. No injury reports, lineup news, tactical changes, rest days, weather, motivation (dead rubbers vs cup finals). Goals aren't perfectly Poisson either — <code>rho</code> corrects low-score clustering but variance still differs by team. Expect the sharp market, which prices all of this in live, to outperform the model on most games.</p>
+          </div>
+          <div class="method-card">
+            <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>Trust the sharp delta</h3>
+            <p>Each edge row shows <code>vs Pinnacle</code> — how far model prob sits from Pinnacle's devigged fair prob. Aligned (±7pp) is most credible; <em>Extreme</em> (&gt;15pp) is almost always model miscalibration on a thin-data team, not a real edge.</p>
           </div>
         </div>
       </section>
@@ -395,6 +498,7 @@ const App = (() => {
       ${renderKpis(fixtures)}
       ${dataInfo}
       ${renderFilters()}
+      ${renderTrackRecord()}
       <div class="section-header">
         <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
         Fixtures
