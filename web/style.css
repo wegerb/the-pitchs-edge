@@ -806,35 +806,77 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
   border-radius: var(--radius-lg);
 }
 .track-record .section-header { margin-bottom: var(--space-3); }
-.track-summary {
+
+/* Hero strip: novice-first.  The primary card (pick accuracy) is visually dominant. */
+.track-hero {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: 1.5fr 1fr 1fr 1fr;
   gap: var(--space-3);
-  margin-bottom: var(--space-3);
+  margin-bottom: var(--space-4);
 }
-.track-fact {
-  padding: var(--space-3);
+.hero-card {
+  padding: var(--space-3) var(--space-4);
   background: var(--color-surface-2);
   border: 1px solid var(--color-border);
-  border-left: 3px solid var(--color-text-muted);
+  border-top: 3px solid var(--color-text-muted);
   border-radius: var(--radius-md);
 }
-.track-fact.good { border-left-color: var(--color-accent); }
-.track-fact.bad { border-left-color: #EF4444; }
-.track-fact .fact-num {
+.hero-card.good { border-top-color: var(--color-accent); }
+.hero-card.bad  { border-top-color: #EF4444; }
+.hero-card.warn { border-top-color: #F59E0B; }
+.hero-card.wr-good { border-top-color: var(--color-accent); }
+.hero-card.wr-ok   { border-top-color: #F59E0B; }
+.hero-card.wr-bad  { border-top-color: #EF4444; }
+.hero-card.wr-na   { border-top-color: var(--color-text-muted); }
+
+.hero-card .hero-lbl {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.hero-card .hero-num {
   font-family: var(--font-display);
-  font-size: 24px;
+  font-size: 28px;
   font-weight: 700;
   color: var(--color-text);
-  line-height: 1.1;
+  line-height: 1.05;
 }
-.track-fact.good .fact-num { color: var(--color-accent); }
-.track-fact.bad .fact-num { color: #EF4444; }
-.track-fact .fact-lbl {
-  margin-top: 4px;
+.hero-card.good .hero-num, .hero-card.wr-good .hero-num { color: var(--color-accent); }
+.hero-card.bad  .hero-num, .hero-card.wr-bad  .hero-num { color: #EF4444; }
+.hero-card.warn .hero-num, .hero-card.wr-ok   .hero-num { color: #F59E0B; }
+.hero-card .hero-sub {
+  margin-top: 6px;
   font-size: var(--text-xs);
   color: var(--color-text-muted);
   line-height: 1.4;
+}
+.hero-sub-sep {
+  margin: 0 6px;
+  opacity: 0.5;
+}
+.hero-card.hero-primary .hero-num {
+  font-size: 40px;
+}
+.hero-card.hero-primary .hero-lbl {
+  font-size: 13px;
+  letter-spacing: 0.05em;
+}
+.hero-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-left: 6px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  color: var(--color-text-muted);
+  vertical-align: middle;
 }
 .track-table-wrap { overflow-x: auto; }
 .track-table {
@@ -877,16 +919,93 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
   background: rgba(239, 68, 68, 0.14);
   color: #EF4444;
 }
-.track-note {
+
+/* Win-rate cell: primary signal in the breakdown table.
+   Color reflects performance vs best naive baseline for that league. */
+.wr-cell {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: var(--radius-full);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-sm);
+}
+.wr-cell.wr-good {
+  background: var(--color-accent-muted);
+  color: var(--color-accent);
+}
+.wr-cell.wr-ok {
+  background: rgba(245, 158, 11, 0.14);
+  color: #F59E0B;
+}
+.wr-cell.wr-bad {
+  background: rgba(239, 68, 68, 0.14);
+  color: #EF4444;
+}
+.wr-cell.wr-na {
+  color: var(--color-text-muted);
+}
+
+.baseline-delta {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.baseline-delta.delta-good { color: var(--color-accent); }
+.baseline-delta.delta-ok   { color: #F59E0B; }
+.baseline-delta.delta-bad  { color: #EF4444; }
+.baseline-delta.muted      { color: var(--color-text-muted); }
+
+/* Plain-English footer for novices. */
+.track-note-simple {
   margin-top: var(--space-3);
   padding: var(--space-3);
-  background: rgba(239, 68, 68, 0.06);
-  border-left: 3px solid #EF4444;
+  background: var(--color-surface-2);
+  border-left: 3px solid var(--color-accent);
   border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  line-height: 1.55;
+}
+.track-note-simple strong { color: var(--color-text); }
+
+/* Expert disclosure (collapsed by default). */
+.track-expert {
+  margin-top: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+}
+.track-expert > summary {
+  padding: 10px var(--space-3);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  user-select: none;
+  list-style: none;
+}
+.track-expert > summary::-webkit-details-marker { display: none; }
+.track-expert > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform 0.15s ease;
+  color: var(--color-text-muted);
+}
+.track-expert[open] > summary::before {
+  transform: rotate(90deg);
+}
+.track-expert[open] > summary {
+  border-bottom: 1px solid var(--color-border);
+}
+.track-note {
+  padding: var(--space-3);
   font-size: var(--text-xs);
   color: var(--color-text-secondary);
-  line-height: 1.5;
+  line-height: 1.55;
 }
+.track-note p { margin: 0 0 10px 0; }
+.track-note p:last-child { margin-bottom: 0; }
 .track-note strong { color: var(--color-text); }
 
 /* ─── Trust badges on edge rows ─── */
@@ -923,10 +1042,36 @@ button { font-family: inherit; cursor: pointer; border: none; background: none; 
 }
 .edge-table tr.trust-extreme td { background: rgba(239, 68, 68, 0.04); }
 
+.val-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.val-badge.val-yes {
+  background: var(--color-accent-muted);
+  color: var(--color-accent);
+}
+.val-badge.val-no {
+  background: var(--color-surface-2);
+  color: var(--color-text-muted);
+}
+
 .method-card.limitations {
   border-left: 3px solid #FACC15;
 }
 
+@media (max-width: 960px) {
+  .track-hero { grid-template-columns: 1fr 1fr; }
+}
 @media (max-width: 720px) {
-  .track-summary { grid-template-columns: 1fr; }
+  .track-hero { grid-template-columns: 1fr; }
+  .hero-card.hero-primary .hero-num { font-size: 32px; }
 }

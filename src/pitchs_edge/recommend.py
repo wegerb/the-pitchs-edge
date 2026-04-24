@@ -20,6 +20,7 @@ from .edge import kelly, shin
 from .models import (
     DixonColesParams,
     fit as fit_dc,
+    fit_xg,
     market_1x2,
     market_asian_handicap,
     market_over_under,
@@ -43,7 +44,8 @@ class Recommendation:
 
 def _load_training_rows(conn, league_id: int) -> list[dict]:
     return conn.execute(
-        """SELECT f.id, f.kickoff, ht.name AS home, at.name AS away, f.fthg, f.ftag
+        """SELECT f.id, f.kickoff, ht.name AS home, at.name AS away,
+                  f.fthg, f.ftag, f.home_xg, f.away_xg
            FROM fixtures f
            JOIN teams ht ON ht.id = f.home_team_id
            JOIN teams at ON at.id = f.away_team_id
@@ -53,10 +55,37 @@ def _load_training_rows(conn, league_id: int) -> list[dict]:
     ).fetchall()
 
 
-def fit_league(conn, league_id: int, *, xi: float = 0.01) -> tuple[DixonColesParams | None, int]:
+def fit_league(
+    conn,
+    league_id: int,
+    *,
+    xi: float = 0.01,
+    model_source: str = "goals",
+) -> tuple[DixonColesParams | None, int]:
+    """Fit Dixon-Coles on a league's finished fixtures.
+
+    `model_source` picks the target: "goals" fits on final score (FTHG/FTAG);
+    "xg" fits on Understat xG (continuous Poisson log-likelihood). xG fit
+    silently falls back to goals if fewer than 50 fixtures have xG populated.
+    """
     rows = _load_training_rows(conn, league_id)
     if len(rows) < 50:
         return None, len(rows)
+
+    if model_source == "xg":
+        xg_rows = [r for r in rows if r["home_xg"] is not None and r["away_xg"] is not None]
+        if len(xg_rows) >= 50:
+            params = fit_xg(
+                home_teams=[r["home"] for r in xg_rows],
+                away_teams=[r["away"] for r in xg_rows],
+                home_xg=[r["home_xg"] for r in xg_rows],
+                away_xg=[r["away_xg"] for r in xg_rows],
+                match_dates=[datetime.fromisoformat(r["kickoff"]) for r in xg_rows],
+                xi=xi,
+            )
+            return params, len(xg_rows)
+        # not enough xG coverage — fall through to goals
+
     params = fit_dc(
         home_teams=[r["home"] for r in rows],
         away_teams=[r["away"] for r in rows],

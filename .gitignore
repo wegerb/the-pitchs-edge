@@ -16,6 +16,7 @@ dist/
 data/*.db
 data/*.db-journal
 data/csv_cache/
+data/understat_cache/
 
 # OS
 .DS_Store

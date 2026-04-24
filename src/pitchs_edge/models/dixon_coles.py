@@ -17,6 +17,7 @@ from typing import Sequence
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.special import gammaln
 from scipy.stats import poisson
 
 MAX_GOALS = 10  # truncation for score-matrix computations
@@ -129,6 +130,96 @@ def fit(
         attack=alpha,
         defense=beta,
         home=float(home),
+        rho=float(rho),
+        xi=xi,
+        log_likelihood=-float(res.fun),
+        as_of=as_of,
+    )
+
+
+def _continuous_poisson_ll(x: np.ndarray, lam: np.ndarray) -> np.ndarray:
+    """Poisson log-density generalized to continuous x via gamma function:
+        log p(x; λ) = x·log(λ) − λ − lgamma(x + 1)
+    Returns element-wise log-likelihood. Safe for x >= 0 and λ > 0.
+    """
+    lam = np.clip(lam, 1e-10, None)
+    return x * np.log(lam) - lam - gammaln(x + 1.0)
+
+
+def fit_xg(
+    home_teams: Sequence[str],
+    away_teams: Sequence[str],
+    home_xg: Sequence[float],
+    away_xg: Sequence[float],
+    match_dates: Sequence[datetime] | np.ndarray,
+    *,
+    xi: float = 0.005,
+    as_of: datetime | None = None,
+    # For prediction we need rho (low-score DC correction). We don't try to learn
+    # rho from xG (nonsense — xG is continuous). Users can pass a rho learned
+    # from a goals-fit, or leave it at a league-typical default.
+    rho: float = -0.08,
+) -> DixonColesParams:
+    """xG-based Dixon-Coles fit.
+
+    Fits per-team attack + defense + home advantage so that expected Poisson
+    rates λ_home, λ_away match the observed **xG** values (not the observed
+    goals). This substantially improves calibration because xG is a
+    variance-reduced estimator of the Poisson rate — one xG observation
+    per match carries roughly 3x the information of one goal count.
+
+    Uses the continuous Poisson log-likelihood (generalized via gamma) so the
+    same scoring rule applies to the xG-is-a-shot-based-estimate-of-λ
+    formulation Dixon-Coles-style models typically use.
+
+    The low-score-dependency `rho` is NOT learned here (it's defined on
+    integer-goal joint distributions); we accept it as a parameter. Defaults
+    to −0.08 which is a well-established league-average value.
+    """
+    teams = sorted(set(list(home_teams) + list(away_teams)))
+    n = len(teams)
+    t_idx = {t: i for i, t in enumerate(teams)}
+    h = np.array([t_idx[t] for t in home_teams])
+    a = np.array([t_idx[t] for t in away_teams])
+    hx = np.asarray(home_xg, dtype=float)
+    ax = np.asarray(away_xg, dtype=float)
+
+    if not isinstance(match_dates, np.ndarray):
+        match_dates = np.array([np.datetime64(d) for d in match_dates])
+    as_of = as_of or datetime.now(timezone.utc).replace(tzinfo=None)
+    weights = _time_weights(match_dates, as_of, xi)
+
+    def nll(packed: np.ndarray) -> float:
+        # packed = [alpha (n-1), beta (n-1), home]
+        alpha = np.empty(n)
+        beta = np.empty(n)
+        alpha[:-1] = packed[: n - 1]
+        beta[:-1] = packed[n - 1 : 2 * (n - 1)]
+        alpha[-1] = -alpha[:-1].sum()
+        beta[-1] = -beta[:-1].sum()
+        home = packed[-1]
+        lam = np.exp(alpha[h] + beta[a] + home)
+        mu = np.exp(alpha[a] + beta[h])
+        ll = _continuous_poisson_ll(hx, lam) + _continuous_poisson_ll(ax, mu)
+        return -float(np.sum(weights * ll))
+
+    x0 = np.concatenate([np.zeros(n - 1), np.zeros(n - 1), [0.3]])
+    bounds = [(-3, 3)] * (n - 1) + [(-3, 3)] * (n - 1) + [(-0.5, 1.5)]
+    res = minimize(nll, x0, method="L-BFGS-B", bounds=bounds)
+
+    alpha = np.empty(n)
+    beta = np.empty(n)
+    alpha[:-1] = res.x[: n - 1]
+    beta[:-1] = res.x[n - 1 : 2 * (n - 1)]
+    alpha[-1] = -alpha[:-1].sum()
+    beta[-1] = -beta[:-1].sum()
+    home = float(res.x[-1])
+
+    return DixonColesParams(
+        teams=teams,
+        attack=alpha,
+        defense=beta,
+        home=home,
         rho=float(rho),
         xi=xi,
         log_likelihood=-float(res.fun),

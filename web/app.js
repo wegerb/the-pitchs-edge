@@ -53,6 +53,11 @@ const App = (() => {
     if (v == null || Number.isNaN(v)) return '—';
     return v.toFixed(places);
   }
+  function decimalToAmerican(d) {
+    if (d == null || Number.isNaN(d) || d <= 1.0) return '—';
+    if (d >= 2.0) return `+${Math.round((d - 1) * 100)}`;
+    return `${Math.round(-100 / (d - 1))}`;
+  }
 
   function selectionLabel(market, sel, line, home, away) {
     if (market === '1X2') {
@@ -283,11 +288,22 @@ const App = (() => {
               const deltaTxt = e.sharp_delta_pp == null
                 ? '—'
                 : `${e.sharp_delta_pp > 0 ? '+' : ''}${e.sharp_delta_pp.toFixed(1)}pp`;
+              // Tuned-config validation tag: leagues that passed an out-of-sample
+              // holdout are shown with a green ✓, others get a warning tick so the
+              // user knows the edge wasn't independently validated.
+              const valTag = e.validated
+                ? `<span class="val-badge val-yes" title="League passed out-of-sample holdout — edge survived on data the tuner never saw.">✓ tuned</span>`
+                : `<span class="val-badge val-no" title="No out-of-sample confirmation for this league yet — treat as informational.">? unvalidated</span>`;
+              // Hover on the Play cell reveals the blend: raw model vs Pinnacle-blended
+              // probability used for sizing, so the user can see exactly what we bet.
+              const blendTip = (e.blended_prob != null && e.model_prob != null)
+                ? `model ${(e.model_prob*100).toFixed(1)}% → blended ${(e.blended_prob*100).toFixed(1)}% (with Pinnacle close)`
+                : `model ${(e.model_prob*100).toFixed(1)}% (no market anchor)`;
               return `
               <tr class="trust-${e.trust}">
-                <td><span class="play-cell"><span class="mkt-tag">${marketTag}</span> ${sel}</span></td>
+                <td title="${blendTip}"><span class="play-cell"><span class="mkt-tag">${marketTag}</span> ${sel} ${valTag}</span></td>
                 <td class="book-cell" title="${e.book}">${e.book}</td>
-                <td class="num">${numPlain(e.price, 2)}</td>
+                <td class="num" title="${numPlain(e.price, 2)} decimal">${decimalToAmerican(e.price)}</td>
                 <td class="num edge-positive">${pctSigned(e.edge_pct)}</td>
                 <td class="num"><span class="trust-badge trust-${e.trust}" title="${t.tip}">${t.label}<span class="trust-delta">${deltaTxt}</span></span></td>
                 <td class="num">${(e.kelly_fraction * 100).toFixed(2)}u</td>
@@ -344,73 +360,226 @@ const App = (() => {
   function renderTrackRecord() {
     const bt = Array.isArray(payload.backtest) ? payload.backtest : [];
     if (!bt.length) return '';
-    const rows = bt.map(r => {
-      const mLL = r.model_log_loss_1x2;
-      const kLL = r.market_log_loss_1x2;
-      const beats = (mLL != null && kLL != null && mLL < kLL);
-      const roi = r.simulated_roi || 0;
-      const roiClass = roi > 0 ? 'roi-pos' : 'roi-neg';
-      const beatClass = beats ? 'beats' : 'trails';
+
+    // Collapse the two price-source rows per league into one row with both ROI columns.
+    // "strict" = pinnacle_close (you bet AT the sharp close — CLV=0 by construction,
+    // so ROI here is pure model skill). "realistic" = best_close (MAX across 6 books
+    // — what a line-shopping bettor would actually get).
+    //
+    // Win-rate metrics (win_rate, baseline_*, n_matches_graded) are model-level,
+    // not price-level, so they are identical across the two rows.
+    const byLeague = new Map();
+    for (const r of bt) {
+      const e = byLeague.get(r.league_code) || { league_code: r.league_code, league_name: r.league_name };
+      const slot = (r.price_source === 'pinnacle_close') ? 'strict' : 'realistic';
+      e[slot] = r;
+      if (e.model_log_loss_1x2 == null) {
+        e.model_log_loss_1x2 = r.model_log_loss_1x2;
+        e.market_log_loss_1x2 = r.market_log_loss_1x2;
+        e.n_predictions = r.n_predictions;
+        e.n_matches_graded = r.n_matches_graded;
+        e.win_rate = r.win_rate;
+        e.baseline_home = r.baseline_home;
+        e.baseline_draw = r.baseline_draw;
+        e.baseline_away = r.baseline_away;
+      }
+      byLeague.set(r.league_code, e);
+    }
+    const leagues = Array.from(byLeague.values()).sort((a, b) => a.league_name.localeCompare(b.league_name));
+
+    // Helpers — win rate classes colored against best naive baseline.
+    const bestBaseline = (e) => {
+      const opts = [e.baseline_home, e.baseline_draw, e.baseline_away].filter(v => v != null);
+      return opts.length ? Math.max(...opts) : null;
+    };
+    const bestBaselineName = (e) => {
+      const arr = [
+        ['always home', e.baseline_home],
+        ['always draw', e.baseline_draw],
+        ['always away', e.baseline_away],
+      ].filter(x => x[1] != null);
+      if (!arr.length) return '—';
+      arr.sort((a, b) => b[1] - a[1]);
+      return arr[0][0];
+    };
+    const winRateClass = (wr, base) => {
+      if (wr == null || base == null) return 'wr-na';
+      const delta = wr - base;
+      if (delta >= 0.05) return 'wr-good';
+      if (delta >= -0.01) return 'wr-ok';
+      return 'wr-bad';
+    };
+    const fmtRoi = (r) => {
+      if (!r || r.simulated_roi == null) return '<span class="num muted">—</span>';
+      const roi = r.simulated_roi;
+      const cls = roi > 0 ? 'roi-pos' : 'roi-neg';
+      return `<span class="${cls}">${(roi * 100).toFixed(1)}%</span>`;
+    };
+    const fmtClv = (r) => {
+      if (!r || r.clv_weighted == null) return '—';
+      const v = r.clv_weighted * 100;
+      const sign = v > 0 ? '+' : '';
+      return `${sign}${v.toFixed(2)}%`;
+    };
+
+    // ── Rows ─────────────────────────────────────────────────────────────
+    const rows = leagues.map(e => {
+      const wr = e.win_rate;
+      const base = bestBaseline(e);
+      const baseName = bestBaselineName(e);
+      const delta = (wr != null && base != null) ? (wr - base) : null;
+      const wrCls = winRateClass(wr, base);
+      const deltaTxt = delta == null
+        ? '—'
+        : `${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(1)}pp`;
+      const deltaCls = delta == null ? 'muted' : (delta >= 0.05 ? 'delta-good' : (delta >= -0.01 ? 'delta-ok' : 'delta-bad'));
+
+      const mLL = e.model_log_loss_1x2;
+      const kLL = e.market_log_loss_1x2;
+      const beatsMkt = (mLL != null && kLL != null && mLL < kLL);
+      const strictBets = e.strict?.simulated_bets ?? 0;
+      const realBets = e.realistic?.simulated_bets ?? 0;
+
+      // Row-level tooltip: full expert detail (calibration + bet counts).
+      const rowTip = [
+        `${e.n_matches_graded ?? '—'} matches graded`,
+        `Best naive baseline: ${baseName} (${wr != null && base != null ? (base * 100).toFixed(1) + '%' : '—'})`,
+        mLL != null ? `Model LL: ${mLL.toFixed(3)}` : null,
+        kLL != null ? `Pinnacle-close LL: ${kLL.toFixed(3)}` : null,
+        beatsMkt ? 'Model beats market on calibration' : 'Market beats model on calibration',
+      ].filter(Boolean).join(' · ');
+
       return `
-        <tr>
-          <td class="league-col">${LEAGUE_FLAG[r.league_code] || ''} ${r.league_name}</td>
-          <td class="num">${r.n_predictions}</td>
-          <td class="num">${mLL?.toFixed(3) ?? '—'}</td>
-          <td class="num muted">${kLL?.toFixed(3) ?? '—'}</td>
-          <td class="num"><span class="beat-pill ${beatClass}">${beats ? 'beats' : 'trails'} market</span></td>
-          <td class="num">${r.simulated_bets}</td>
-          <td class="num ${roiClass}">${(roi * 100).toFixed(1)}%</td>
+        <tr title="${rowTip}">
+          <td class="league-col">${LEAGUE_FLAG[e.league_code] || ''} ${e.league_name}</td>
+          <td class="num">${e.n_matches_graded ?? '—'}</td>
+          <td class="num"><span class="wr-cell ${wrCls}">${wr != null ? (wr * 100).toFixed(1) + '%' : '—'}</span></td>
+          <td class="num"><span class="baseline-delta ${deltaCls}" title="Win rate minus best naive baseline (${baseName})">${deltaTxt}</span></td>
+          <td class="num" title="${strictBets} simulated bets at Pinnacle closing — CLV is 0 by construction here, so this is pure model skill.">${fmtRoi(e.strict)}</td>
+          <td class="num" title="${realBets} simulated bets at best price across 6 books. CLV (stake-wtd) vs Pinnacle close: ${fmtClv(e.realistic)}">${fmtRoi(e.realistic)}</td>
         </tr>
       `;
     }).join('');
-    // Quick honesty summary
-    const beatCount = bt.filter(r => r.model_log_loss_1x2 != null && r.market_log_loss_1x2 != null && r.model_log_loss_1x2 < r.market_log_loss_1x2).length;
-    const profitable = bt.filter(r => (r.simulated_roi || 0) > 0).length;
-    const totalBets = bt.reduce((s, r) => s + (r.simulated_bets || 0), 0);
-    const totalPnl = bt.reduce((s, r) => {
-      if (r.bankroll_final == null || r.bankroll_start == null) return s;
+
+    // ── Hero aggregates ──────────────────────────────────────────────────
+    // Overall pick accuracy: total hits / total graded matches (volume-weighted,
+    // so E1's 897 matches outweigh E0's 60).
+    const totalGraded = leagues.reduce((s, e) => s + (e.n_matches_graded || 0), 0);
+    const totalHits = leagues.reduce((s, e) => {
+      if (e.win_rate == null || !e.n_matches_graded) return s;
+      return s + (e.win_rate * e.n_matches_graded);
+    }, 0);
+    const overallWR = totalGraded > 0 ? (totalHits / totalGraded) : null;
+
+    // Aggregate best-naive-baseline (volume-weighted) — what you'd get picking
+    // home every match, weighted by matches per league. This is the honest
+    // "dumb" benchmark.
+    const totalBaselineHits = leagues.reduce((s, e) => {
+      const b = bestBaseline(e);
+      if (b == null || !e.n_matches_graded) return s;
+      return s + (b * e.n_matches_graded);
+    }, 0);
+    const overallBase = totalGraded > 0 ? (totalBaselineHits / totalGraded) : null;
+    const overallDelta = (overallWR != null && overallBase != null) ? (overallWR - overallBase) : null;
+
+    // Leagues beating their own best baseline by ≥ 1pp (ties excluded).
+    const beatBaselineCount = leagues.filter(e => {
+      const b = bestBaseline(e);
+      return e.win_rate != null && b != null && (e.win_rate - b) >= 0.01;
+    }).length;
+
+    // Aggregate bankroll ROI — best price (line-shopping, the realistic bar).
+    const totalBets = leagues.reduce((s, e) => s + (e.realistic?.simulated_bets || 0), 0);
+    const totalPnl = leagues.reduce((s, e) => {
+      const r = e.realistic;
+      if (!r || r.bankroll_final == null || r.bankroll_start == null) return s;
       return s + (r.bankroll_final - r.bankroll_start);
     }, 0);
-    const totalStart = bt.reduce((s, r) => s + (r.bankroll_start || 0), 0);
+    const totalStart = leagues.reduce((s, e) => s + (e.realistic?.bankroll_start || 0), 0);
     const aggRoi = totalStart > 0 ? (totalPnl / totalStart) : 0;
+
+    const totalStrictBets = leagues.reduce((s, e) => s + (e.strict?.simulated_bets || 0), 0);
+    const totalStrictPnl = leagues.reduce((s, e) => {
+      const r = e.strict;
+      if (!r || r.bankroll_final == null || r.bankroll_start == null) return s;
+      return s + (r.bankroll_final - r.bankroll_start);
+    }, 0);
+    const totalStrictStart = leagues.reduce((s, e) => s + (e.strict?.bankroll_start || 0), 0);
+    const strictRoi = totalStrictStart > 0 ? (totalStrictPnl / totalStrictStart) : 0;
+
+    // Hero card classes.
+    const wrCls = winRateClass(overallWR, overallBase);
+    const deltaCls = overallDelta == null ? 'muted' : (overallDelta >= 0.05 ? 'delta-good' : (overallDelta >= -0.01 ? 'delta-ok' : 'delta-bad'));
+    const deltaTxt = overallDelta == null
+      ? '—'
+      : `${overallDelta >= 0 ? '+' : ''}${(overallDelta * 100).toFixed(1)}pp vs naive`;
 
     return `
       <section class="track-record">
         <div class="section-header">
           <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg>
-          Track record (walk-forward backtest on most recent completed season)
+          Track record — held-out seasons
         </div>
-        <div class="track-summary">
-          <div class="track-fact ${beatCount >= 3 ? 'good' : 'bad'}">
-            <div class="fact-num">${beatCount}/${bt.length}</div>
-            <div class="fact-lbl">leagues where model log-loss beats Pinnacle closing</div>
+
+        <!-- Hero cards: novice-first. Biggest number is pick accuracy. -->
+        <div class="track-hero">
+          <div class="hero-card hero-primary ${wrCls}">
+            <div class="hero-lbl">Pick accuracy</div>
+            <div class="hero-num">${overallWR != null ? (overallWR * 100).toFixed(1) + '%' : '—'}</div>
+            <div class="hero-sub">
+              <span class="${deltaCls}">${deltaTxt}</span>
+              <span class="hero-sub-sep">·</span>
+              <span>${totalGraded.toLocaleString()} matches graded</span>
+            </div>
           </div>
-          <div class="track-fact ${profitable >= 3 ? 'good' : 'bad'}">
-            <div class="fact-num">${profitable}/${bt.length}</div>
-            <div class="fact-lbl">leagues with positive ROI betting at closing prices</div>
+          <div class="hero-card ${beatBaselineCount >= leagues.length / 2 ? 'good' : 'warn'}">
+            <div class="hero-lbl">Leagues beating naive baseline</div>
+            <div class="hero-num">${beatBaselineCount}/${leagues.length}</div>
+            <div class="hero-sub">by at least 1 percentage point</div>
           </div>
-          <div class="track-fact ${aggRoi >= 0 ? 'good' : 'bad'}">
-            <div class="fact-num">${(aggRoi * 100).toFixed(1)}%</div>
-            <div class="fact-lbl">aggregate simulated ROI on ${totalBets} bets across all leagues</div>
+          <div class="hero-card ${aggRoi >= 0 ? 'good' : 'bad'}">
+            <div class="hero-lbl">Best-price ROI <span class="hero-tag">realistic</span></div>
+            <div class="hero-num">${(aggRoi * 100).toFixed(1)}%</div>
+            <div class="hero-sub">${totalBets.toLocaleString()} simulated bets · line-shopped across 6 books</div>
+          </div>
+          <div class="hero-card ${strictRoi >= 0 ? 'good' : 'bad'}">
+            <div class="hero-lbl">Pinnacle-close ROI <span class="hero-tag">strict</span></div>
+            <div class="hero-num">${(strictRoi * 100).toFixed(1)}%</div>
+            <div class="hero-sub">${totalStrictBets.toLocaleString()} bets · settled at sharpest book</div>
           </div>
         </div>
+
+        <!-- League breakdown: win rate is primary, ROI secondary. -->
         <div class="track-table-wrap">
           <table class="track-table">
             <thead><tr>
               <th>League</th>
-              <th class="num">Predictions</th>
-              <th class="num">Model LL</th>
-              <th class="num">Market LL</th>
-              <th class="num">vs market</th>
-              <th class="num">Bets</th>
-              <th class="num">ROI</th>
+              <th class="num" title="Completed fixtures used to grade the model in the held-out seasons.">Matches</th>
+              <th class="num" title="% of matches where the model's top pick (home / draw / away) matched the final result.">Win rate</th>
+              <th class="num" title="Win rate minus the best naive baseline for that league (always-home, always-draw, or always-away).">vs Naive</th>
+              <th class="num" title="ROI settling bets at Pinnacle closing price — the sharpest public book. CLV is 0 by construction, so this measures pure model skill.">Strict ROI</th>
+              <th class="num" title="ROI settling bets at best price across 6 books (Pinnacle, B365, BW, BF, WH, BFE). What a line-shopping bettor would actually capture.">Best-price ROI</th>
             </tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
-        <p class="track-note">
-          <strong>LL</strong> = 1X2 log-loss (lower is better). Model predictions generated via walk-forward refit (step = 20 fixtures); bets sized at ¼-Kelly / 2% cap and placed at Pinnacle closing prices. CLV is 0 by construction — this is the strict "would you beat the closing line" test. The honest read: across top-6 leagues last season, the model <em>did not</em> beat Pinnacle's closing line. That is the norm for a public model; shipping these numbers keeps expectations honest.
+
+        <!-- Plain-English footer for novices; expert details in a disclosure. -->
+        <p class="track-note-simple">
+          <strong>Win rate</strong> is how often the model's top pick — the most likely of home / draw / away — matched the real result. <strong>vs Naive</strong> compares it to the best "dumb" strategy for that league (always picking home, draw, or away, whichever wins most). A positive number means the model is actually adding something over coin-flipping the most common result.
+          <br><br>
+          Win rate is the "did we call it right?" number. <strong>ROI</strong> is the "did we make money?" number — they're not the same, because betting on longshots at the right price can be profitable even at a low win rate, and hammering favorites at bad prices can lose money even at a high win rate.
         </p>
+
+        <details class="track-expert">
+          <summary>Methodology &amp; caveats (for experts)</summary>
+          <div class="track-note">
+            <p><strong>Walk-forward backtest</strong>, step = 20 fixtures, refit per league using each league's <em>tuned</em> config from <code>tuned_configs.py</code>: per-league <code>xi</code>, <code>edge_threshold</code>, <code>min_training</code>, <code>model_source</code> (goals vs xG), and a Pinnacle-closing blend (<code>model_weight</code>) on the probability used for edge / Kelly. Bets sized at ¼-Kelly / 2% bankroll cap.</p>
+            <p><strong>Two ROI bars.</strong> <em>Strict ROI</em> settles at Pinnacle closing — CLV = 0 by construction, so if we're positive here the model itself has an edge over the sharpest book. <em>Best-price ROI</em> settles at the MAX price across 6 books — what a disciplined line-shopper actually captures. The spread between the two is the line-shopping premium, not model skill.</p>
+            <p><strong>Calibration (log-loss).</strong> Hover a league row to see Model LL vs Pinnacle-close LL. Log-loss measures whether the probabilities are well-calibrated (sharp and accurate), which is more precise than raw win rate but harder to read at a glance.</p>
+            <p><strong>The honest read.</strong> Out-of-sample, E0 (xG) and E1 (Championship) are the only leagues where the edge survived a clean holdout; they're flagged <strong>✓ tuned</strong> on the edge sheet above. Everything else is informational until a clean holdout confirms it. Win-rate alone can look fine while ROI is negative if the model is right on chalk (low payout) and wrong on longshots (no recouping).</p>
+          </div>
+        </details>
       </section>
     `;
   }
@@ -430,7 +599,7 @@ const App = (() => {
           </div>
           <div class="method-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg>Edge &amp; Kelly</h3>
-            <p>Edge = <code>model_prob × price − 1</code>. Stake is ¼-Kelly, capped at 2% of bankroll to bound variance when the model is wrong. Edges surface only at &gt;3% (below that is market noise).</p>
+            <p>Edge = <code>model_prob × decimal_price − 1</code>. Prices are shown in American odds; hover for the decimal equivalent. Stake is ¼-Kelly, capped at 2% of bankroll to bound variance when the model is wrong. Edges surface only at &gt;3% (below that is market noise).</p>
           </div>
           <div class="method-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>CLV &gt; win rate</h3>
@@ -498,12 +667,12 @@ const App = (() => {
       ${renderKpis(fixtures)}
       ${dataInfo}
       ${renderFilters()}
-      ${renderTrackRecord()}
       <div class="section-header">
         <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
         Fixtures
       </div>
       ${grid}
+      ${renderTrackRecord()}
       ${renderMethodology()}
     `;
     main.setAttribute('aria-busy', 'false');
@@ -579,6 +748,10 @@ const App = (() => {
     const dateInput = document.getElementById('date-input');
     const prev = document.getElementById('date-prev');
     const next = document.getElementById('date-next');
+    // Default to today so prev/next arrows anchor somewhere useful. User can
+    // still clear the field to see all upcoming fixtures.
+    currentDate = fmtDate(new Date());
+    dateInput.value = currentDate;
     dateInput.addEventListener('change', () => {
       currentDate = dateInput.value || null;
       render();

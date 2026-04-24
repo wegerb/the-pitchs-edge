@@ -32,6 +32,7 @@ from pitchs_edge.models import (
 )
 from pitchs_edge.names import best_match
 from pitchs_edge.recommend import fit_league
+from pitchs_edge.tuned_configs import TunedConfig, get_tuned
 
 OUT = REPO_ROOT / "web" / "data.json"
 
@@ -79,30 +80,100 @@ def _expected_goals(mat: np.ndarray) -> tuple[float, float]:
     return float(hg), float(ag)
 
 
+def _winrate_for_run(conn, run_id: int) -> dict:
+    """Grade every walk-forward 1X2 prediction in `run_id` against the actual result.
+
+    Returns: n_matches, win_rate (model top pick), plus the three naive baselines
+    (always-home, always-draw, always-away) on the same fixture set so the
+    frontend can show the delta over the best naive strategy — the simplest
+    possible "is this model doing real work?" check for non-experts.
+
+    Prediction rows in backtest_predictions carry one row per (fixture, selection)
+    with `model_prob` and `actual` (1 if this selection was the result, else 0).
+    We pivot to one row per fixture, pick argmax(model_prob), and compare.
+    """
+    rows = conn.execute(
+        """SELECT fixture_id,
+                  MAX(CASE WHEN selection='home' THEN model_prob END) AS mh,
+                  MAX(CASE WHEN selection='draw' THEN model_prob END) AS md,
+                  MAX(CASE WHEN selection='away' THEN model_prob END) AS ma,
+                  MAX(CASE WHEN selection='home' AND actual=1 THEN 1 ELSE 0 END) AS ah,
+                  MAX(CASE WHEN selection='draw' AND actual=1 THEN 1 ELSE 0 END) AS ad,
+                  MAX(CASE WHEN selection='away' AND actual=1 THEN 1 ELSE 0 END) AS aa
+           FROM backtest_predictions
+           WHERE run_id = ? AND market = '1X2'
+           GROUP BY fixture_id""",
+        (run_id,),
+    ).fetchall()
+    n = len(rows)
+    if n == 0:
+        return {"n_matches": 0, "win_rate": None,
+                "baseline_home": None, "baseline_draw": None, "baseline_away": None}
+    mhit = hhit = dhit = ahit = 0
+    for r in rows:
+        probs = ((r["mh"] if r["mh"] is not None else -1, 0),
+                 (r["md"] if r["md"] is not None else -1, 1),
+                 (r["ma"] if r["ma"] is not None else -1, 2))
+        actuals = (r["ah"], r["ad"], r["aa"])
+        midx = max(probs, key=lambda x: x[0])[1]
+        mhit += actuals[midx]
+        hhit += actuals[0]
+        dhit += actuals[1]
+        ahit += actuals[2]
+    return {
+        "n_matches": n,
+        "win_rate": mhit / n,
+        "baseline_home": hhit / n,
+        "baseline_draw": dhit / n,
+        "baseline_away": ahit / n,
+    }
+
+
 def _latest_backtest_runs(conn) -> list[dict]:
-    """Most recent walk-forward backtest per league, for the Track Record panel."""
+    """Most recent walk-forward backtest per (league, price_source), for the Track Record panel.
+
+    Two rows per league: one settled at Pinnacle closing (the "strict bar" —
+    CLV is 0 by construction so ROI alone reflects calibration skill), one at
+    best-price-across-books (the "realistic bar" — reflects what a line-shopping
+    bettor would actually capture). The frontend collapses these into a single
+    league row with both ROI columns.
+
+    We also grade every prediction against actual outcomes (win rate) and
+    compute the three always-X baselines — that's what the UI's hero cards
+    and per-league win-rate column use.
+    """
     rows = conn.execute(
         """SELECT r.id, l.code, l.name AS league_name, r.seasons, r.xi, r.n_predictions,
                   r.log_loss_1x2, r.market_log_loss_1x2,
                   r.rps_1x2, r.market_rps_1x2,
                   r.log_loss_ou25, r.market_log_loss_ou25,
                   r.simulated_n_bets, r.simulated_roi,
-                  r.bankroll_start, r.bankroll_final, r.created_at
+                  r.bankroll_start, r.bankroll_final, r.created_at,
+                  r.price_source, r.model_weight, r.model_source,
+                  r.clv_weighted, r.clv_mean, r.clv_positive_rate
            FROM backtest_runs r
            JOIN leagues l ON l.id = r.league_id
            WHERE r.id IN (
-               SELECT MAX(id) FROM backtest_runs GROUP BY league_id
+               SELECT MAX(id) FROM backtest_runs
+               WHERE price_source IS NOT NULL
+               GROUP BY league_id, price_source
            )
-           ORDER BY l.code"""
+           ORDER BY l.code, r.price_source"""
     ).fetchall()
     out = []
     for r in rows:
+        wr = _winrate_for_run(conn, r["id"])
         out.append({
             "league_code": r["code"],
             "league_name": r["league_name"],
             "seasons": r["seasons"],
             "xi": r["xi"],
             "n_predictions": r["n_predictions"],
+            "n_matches_graded": wr["n_matches"],
+            "win_rate": wr["win_rate"],
+            "baseline_home": wr["baseline_home"],
+            "baseline_draw": wr["baseline_draw"],
+            "baseline_away": wr["baseline_away"],
             "model_log_loss_1x2": r["log_loss_1x2"],
             "market_log_loss_1x2": r["market_log_loss_1x2"],
             "model_rps_1x2": r["rps_1x2"],
@@ -114,6 +185,12 @@ def _latest_backtest_runs(conn) -> list[dict]:
             "bankroll_start": r["bankroll_start"],
             "bankroll_final": r["bankroll_final"],
             "run_at": r["created_at"],
+            "price_source": r["price_source"],
+            "model_weight": r["model_weight"],
+            "model_source": r["model_source"],
+            "clv_weighted": r["clv_weighted"],
+            "clv_mean": r["clv_mean"],
+            "clv_positive_rate": r["clv_positive_rate"],
         })
     return out
 
@@ -220,7 +297,7 @@ def _best_book_price(odds_rows: list[dict], market: str, selection: str, line: f
 
 def _build_fixture(
     *, params: DixonColesParams, league: dict, conn, fx: dict, odds_rows: list[dict],
-    threshold: float, kelly_scale: float, kelly_cap: float,
+    tuned: TunedConfig,
 ) -> dict | None:
     # Fixture sources use long names ("Manchester City FC"); training CSVs use
     # short names ("Man City"). Resolve through the canonical team list the
@@ -290,38 +367,58 @@ def _build_fixture(
         if per_sel:
             best_odds[market + (f"_{line}" if line is not None else "")] = per_sel
 
-    # Edge computation.
+    # Edge computation — mirrors the walk-forward engine.
+    #
+    # Three things happen per (market, selection):
+    #   1. Blend model probs with Pinnacle's devigged close:
+    #        p_bet = w·p_model + (1-w)·p_pinnacle_close
+    #      This is the probability we bet with. w is per-league tuned.
+    #   2. Edge = p_bet × price − 1 gates on `tuned.edge_threshold`.
+    #   3. Kelly sizing uses p_bet (not raw p_model).
+    #
+    # If we have no Pinnacle close for a market we fall back to pure model
+    # probs (w=1) — better to surface a possibly-weaker edge than drop the
+    # fixture. Those plays are still flagged via `trust="unknown"`.
     model_lookup = {
         "1X2": (one_x_two, None),
         "OU":  (ou25,      2.5),
     }
-    # Pinnacle-devig reference per market, used to annotate each edge with a
-    # sanity check: edges where the model disagrees with the sharp market by a
-    # large margin are more likely to be miscalibration than real value.
     market_probs_lookup = {
         "1X2": market_1x2_probs,
         "OU":  market_ou25_probs,
     }
+    w = float(tuned.model_weight)
     edges: list[dict] = []
     for market_key, (probs, line) in model_lookup.items():
         key = market_key + (f"_{line}" if line is not None else "")
         if key not in best_odds:
             continue
+        market_probs = market_probs_lookup.get(market_key)
         for sel, book_info in best_odds[key].items():
             mp = float(probs.get(sel, 0.0))
-            price = book_info["price"]
-            edge = mp * price - 1.0
-            if edge <= threshold or not (0 < mp < 1):
+            if not 0.0 < mp < 1.0:
                 continue
-            ks = kelly(mp, price, scale=kelly_scale, cap=kelly_cap)
+            price = book_info["price"]
+            mkt_p = market_probs.get(sel) if market_probs else None
+
+            # Blend if we have a sharp anchor; otherwise bet pure model.
+            if mkt_p is not None:
+                p_bet = w * mp + (1.0 - w) * float(mkt_p)
+            else:
+                p_bet = mp
+            p_bet = max(min(p_bet, 0.9999), 0.0001)
+
+            edge = p_bet * price - 1.0
+            if edge <= tuned.edge_threshold:
+                continue
+            ks = kelly(p_bet, price, scale=tuned.kelly_scale, cap=tuned.kelly_cap)
             if ks.fraction <= 0:
                 continue
-            market_probs = market_probs_lookup.get(market_key) or {}
-            mkt_p = market_probs.get(sel)
+
+            # Trust flag is driven by the raw model-vs-market gap, not the blend —
+            # the blend itself already tempers the model, but a raw >15pp gap is
+            # still useful diagnostic info for the UI.
             sharp_delta_pp = (mp - mkt_p) * 100.0 if mkt_p is not None else None
-            # Flag edges where the model aggressively disagrees with Pinnacle.
-            # A model prob >15pp above the sharp devigged prob is usually
-            # miscalibration, not value — worth warning rather than hiding.
             if sharp_delta_pp is None:
                 trust = "unknown"
             elif sharp_delta_pp > 15:
@@ -330,6 +427,7 @@ def _build_fixture(
                 trust = "wide"
             else:
                 trust = "aligned"
+
             edges.append({
                 "market": market_key,
                 "selection": sel,
@@ -337,6 +435,7 @@ def _build_fixture(
                 "book": book_info["book"],
                 "price": price,
                 "model_prob": mp,
+                "blended_prob": p_bet,
                 "market_prob": mkt_p,
                 "sharp_delta_pp": sharp_delta_pp,
                 "trust": trust,
@@ -344,6 +443,7 @@ def _build_fixture(
                 "kelly_fraction": float(ks.fraction),
                 "tier": _tier(edge),
                 "stars": _stars(edge),
+                "validated": tuned.validated,
             })
     edges.sort(key=lambda e: -e["edge_pct"])
 
@@ -387,6 +487,10 @@ def build() -> dict:
     leagues_seen: list[dict] = []
     notes: list[str] = []
 
+    # Capture the tuned config per league so the frontend can surface it on
+    # the Track Record panel / "why this play" tooltip.
+    tuning_out: list[dict] = []
+
     with connect() as conn:
         for league_meta in LEAGUES:
             lg = conn.execute(
@@ -396,7 +500,10 @@ def build() -> dict:
             if not lg:
                 notes.append(f"{league_meta.code}: league row missing — run scripts/init_db.py")
                 continue
-            params, train_rows = fit_league(conn, lg["id"])
+            tuned = get_tuned(lg["code"])
+            params, train_rows = fit_league(
+                conn, lg["id"], xi=tuned.xi, model_source=tuned.model_source,
+            )
             if params is None:
                 notes.append(f"{league_meta.code}: insufficient training data ({train_rows} rows) — run scripts/backfill_csv.py")
                 continue
@@ -404,7 +511,22 @@ def build() -> dict:
             if not fixtures:
                 notes.append(f"{league_meta.code}: no upcoming fixtures — run scripts/fetch_fixtures.py")
                 continue
-            leagues_seen.append({"code": lg["code"], "name": lg["name"], "country": lg["country"]})
+            leagues_seen.append({
+                "code": lg["code"], "name": lg["name"], "country": lg["country"],
+            })
+            tuning_out.append({
+                "league_code": lg["code"],
+                "xi": tuned.xi,
+                "model_source": tuned.model_source,
+                "min_training_matches": tuned.min_training_matches,
+                "edge_threshold": tuned.edge_threshold,
+                "model_weight": tuned.model_weight,
+                "validated": tuned.validated,
+                "notes": tuned.notes,
+                "holdout_roi": tuned.holdout_roi,
+                "holdout_clv": tuned.holdout_clv,
+                "holdout_n_bets": tuned.holdout_n_bets,
+            })
             scored_with_odds = 0
             for fx in fixtures:
                 odds = _latest_odds(conn, fx["id"])
@@ -412,7 +534,7 @@ def build() -> dict:
                     continue
                 built = _build_fixture(
                     params=params, league=lg, conn=conn, fx=fx, odds_rows=odds,
-                    threshold=0.03, kelly_scale=0.25, kelly_cap=0.02,
+                    tuned=tuned,
                 )
                 if built:
                     fixtures_out.append(built)
@@ -436,6 +558,7 @@ def build() -> dict:
         "leagues": leagues_seen,
         "fixtures": fixtures_out,
         "backtest": backtest,
+        "tuning": tuning_out,
         "stats": {
             "total_fixtures": len(fixtures_out),
             "total_edges": total_edges,

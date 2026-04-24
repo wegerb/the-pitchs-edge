@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS fixtures (
     ftag           INTEGER,
     hthg           INTEGER,
     htag           INTEGER,
+    home_xg        REAL,
+    away_xg        REAL,
+    home_corners   INTEGER,
+    away_corners   INTEGER,
     status         TEXT NOT NULL DEFAULT 'scheduled',
     external_ids   TEXT,
     UNIQUE(league_id, season, kickoff, home_team_id, away_team_id)
@@ -97,6 +101,24 @@ CREATE TABLE IF NOT EXISTS model_runs (
     log_likelihood REAL
 );
 
+-- Per-fixture, per-team adjustments to attack/defense rates, typically driven by
+-- lineup or injury news. Applied multiplicatively on top of the fitted rates at
+-- prediction time. attack_delta / defense_delta are ADDITIVE in log-space (so
+-- -0.10 ≈ 10% rate cut, +0.10 ≈ 10% rate boost). Source is a free-form tag
+-- ('manual', 'api_football', 'transfermarkt', etc.) so we can audit later.
+CREATE TABLE IF NOT EXISTS team_adjustments (
+    id              INTEGER PRIMARY KEY,
+    fixture_id      INTEGER NOT NULL REFERENCES fixtures(id),
+    team_id         INTEGER NOT NULL REFERENCES teams(id),
+    attack_delta    REAL NOT NULL DEFAULT 0.0,
+    defense_delta   REAL NOT NULL DEFAULT 0.0,
+    note            TEXT,
+    source          TEXT NOT NULL DEFAULT 'manual',
+    applied_at      TEXT NOT NULL,
+    UNIQUE(fixture_id, team_id, source)
+);
+CREATE INDEX IF NOT EXISTS ix_team_adj_fixture ON team_adjustments(fixture_id);
+
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id                   INTEGER PRIMARY KEY,
     name                 TEXT NOT NULL,
@@ -122,7 +144,16 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     simulated_n_bets     INTEGER,
     simulated_pnl        REAL,
     simulated_roi        REAL,
-    bankroll_final       REAL
+    bankroll_final       REAL,
+    -- How simulated bets were priced. The Track Record panel shows "strict"
+    -- (pinnacle_close, CLV=0 bar) alongside "realistic" (best_close, line
+    -- shopping across 6 books) so positive CLV isn't mistaken for edge.
+    price_source         TEXT DEFAULT 'pinnacle_close',
+    model_weight         REAL DEFAULT 1.0,
+    model_source         TEXT DEFAULT 'goals',
+    clv_weighted         REAL,
+    clv_mean             REAL,
+    clv_positive_rate    REAL
 );
 
 CREATE TABLE IF NOT EXISTS backtest_predictions (
